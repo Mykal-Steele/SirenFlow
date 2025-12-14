@@ -1,0 +1,41 @@
+# Environment and secrets
+.env
+client.properties
+*.json
+key.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Node.js (for frontend)
+node_modules/
+.next/
+out/
+.nuxt/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+build/
+*.egg-info/
