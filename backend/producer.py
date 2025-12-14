@@ -1,78 +1,24 @@
-# backend/producer.py - Ambulance Simulator
-import os
 import time
 import json
 import random
 import math
 from confluent_kafka import Producer
+from config import (
+    get_kafka_producer_config,
+    GPS_TOPIC,
+    SENSOR_TOPIC,
+    COMMAND_TOPIC,
+    ASOK_INTERSECTION
+)
 
-def haversine(lat1, lon1, lat2, lon2):
-    """Calculate the great-circle distance between two points in kilometers"""
-    R = 6371
+# Simulation constants
+AMBULANCE_ID = "AMB-TH-882"
+BASE_SPEED_KMH = 60.0
+MIN_SPEED_KMH = 20.0
+MAX_SPEED_KMH = 80.0
+UPDATE_INTERVAL_S = 1.0
 
-    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-    c = 2 * math.asin(math.sqrt(a)) 
-    
-    return R * c
-
-def load_env():
-    """Load environment variables from .env file"""
-    env_vars = {}
-    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
-    with open(env_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                key, value = line.split('=', 1)
-                value = value.strip().strip('"').strip("'")
-                env_vars[key.strip()] = value
-    return env_vars
-
-# Load configuration
-env = load_env()
-
-BOOTSTRAP_SERVER = env.get('Bootstrap_server')
-API_KEY = env.get('Confluent_API')
-API_SECRET = env.get('Confluent_API_SECRET')
-
-# Kafka producer configuration
-conf = {
-    'bootstrap.servers': BOOTSTRAP_SERVER,
-    'sasl.mechanism': 'PLAIN',
-    'security.protocol': 'SASL_SSL',
-    'sasl.username': API_KEY,
-    'sasl.password': API_SECRET,
-}
-
-# Initialize producer 
-producer = Producer(conf)
-print("Kafka Producer initialized successfully.")
-
-# Topics
-GPS_TOPIC = 'topic_ambulance_gps'
-SENSOR_TOPIC = 'topic_sensors'
-TOPIC_TRAFFIC_COMMANDS = 'topic_traffic_commands'
-
-def delivery_report(err, msg):
-    """Callback for message delivery reports"""
-    if err is not None:
-        print(f'Message delivery failed: {err}')
-    else:
-        print(f'Message delivered to {msg.topic()} [{msg.partition()}]')
-
-def produce_message(topic, key, value):
-    """Produce a message to the specified topic"""
-    producer.produce(topic, key=key, value=value, callback=delivery_report)
-    producer.flush()
-
-# Route and ambulance configuration
-ASOK_INTERSECTION = {"lat": 13.73702, "lon": 100.56041}
-
-AMBULANCE_ROUTE_POLYLINE = [
+AMBULANCE_ROUTE = [
     {"lat": 13.74600, "lon": 100.56700},
     {"lat": 13.74400, "lon": 100.56550},
     {"lat": 13.74200, "lon": 100.56380},
@@ -80,28 +26,33 @@ AMBULANCE_ROUTE_POLYLINE = [
     {"lat": 13.73702, "lon": 100.56041}
 ]
 
-AMBULANCE_ID = "AMB-TH-882"
-SPEED_KMH = 45.0
-UPDATE_INTERVAL_S = 1.0
-DISTANCE_STEP_M = (SPEED_KMH / 3600) * 1000 * UPDATE_INTERVAL_S
+producer = Producer(get_kafka_producer_config())
+print("Kafka Producer initialized")
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Calculate distance between two GPS coordinates in km"""
+    R = 6371
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
+
+def delivery_report(err, msg):
+    if err is not None:
+        print(f'Delivery failed: {err}')
 
 polyline_index = 0
-current_lat = AMBULANCE_ROUTE_POLYLINE[0]["lat"]
-current_lon = AMBULANCE_ROUTE_POLYLINE[0]["lon"]
-
-# Markov Chain for Traffic Density
+current_lat = AMBULANCE_ROUTE[0]["lat"]
+current_lon = AMBULANCE_ROUTE[0]["lon"]
+current_speed = BASE_SPEED_KMH
 current_density = 50.0
 
 def get_next_density():
-    """Simulates traffic density using a simple Markov Chain."""
     global current_density
-    
-    fluctuation = random.normalvariate(0, 5) 
-    
-    next_density = current_density + fluctuation
-    
-    next_density = max(0, min(100, next_density))
-    current_density = next_density
+    fluctuation = random.normalvariate(0, 5)
+    current_density = max(0, min(100, current_density + fluctuation))
     
     sensor_data = {
         "intersection_id": "ASOK",
@@ -111,35 +62,59 @@ def get_next_density():
     }
     
     producer.produce(SENSOR_TOPIC, key="ASOK", value=json.dumps(sensor_data))
-    
     return sensor_data
 
 def get_ambulance_telemetry():
-    """Generates GPS telemetry by moving the ambulance along the polyline"""
-    global polyline_index, current_lat, current_lon
+    global polyline_index, current_lat, current_lon, current_speed
     
-    if polyline_index >= len(AMBULANCE_ROUTE_POLYLINE) - 1:
-        print("\nAmbulance reached the intersection. Stopping simulation.")
+    if polyline_index >= len(AMBULANCE_ROUTE) - 1:
+        print("\nAmbulance reached intersection")
         return None
     
-    start_point = AMBULANCE_ROUTE_POLYLINE[polyline_index]
-    end_point = AMBULANCE_ROUTE_POLYLINE[polyline_index + 1]
+    start_point = AMBULANCE_ROUTE[polyline_index]
+    end_point = AMBULANCE_ROUTE[polyline_index + 1]
 
-    segment_dist_km = haversine(start_point["lat"], start_point["lon"], 
-                                end_point["lat"], end_point["lon"])
+    dist_to_asok_km = haversine(
+        current_lat, current_lon, 
+        ASOK_INTERSECTION["lat"], ASOK_INTERSECTION["lon"]
+    )
+    
+    target_speed = BASE_SPEED_KMH
+    
+    if dist_to_asok_km < 0.3:
+        target_speed = MIN_SPEED_KMH + (dist_to_asok_km / 0.3) * (BASE_SPEED_KMH - MIN_SPEED_KMH)
+    elif dist_to_asok_km > 1.0:
+        target_speed = BASE_SPEED_KMH + random.uniform(-5, 10)
+    else:
+        traffic_factor = max(0.3, 1.0 - (current_density / 200))
+        target_speed = BASE_SPEED_KMH * traffic_factor + random.uniform(-8, 8)
+    
+    target_speed = max(MIN_SPEED_KMH, min(MAX_SPEED_KMH, target_speed))
+    
+    if abs(current_speed - target_speed) > 15:
+        acceleration = 3.0 if target_speed > current_speed else -4.0
+        current_speed += acceleration * UPDATE_INTERVAL_S
+    else:
+        current_speed += (target_speed - current_speed) * 0.3
+    
+    current_speed = max(MIN_SPEED_KMH, min(MAX_SPEED_KMH, current_speed))
+    
+    distance_step_m = (current_speed / 3600) * 1000 * UPDATE_INTERVAL_S
+
+    segment_dist_km = haversine(
+        start_point["lat"], start_point["lon"], 
+        end_point["lat"], end_point["lon"]
+    )
     segment_dist_m = segment_dist_km * 1000
 
-    current_lat += (end_point["lat"] - start_point["lat"]) / (segment_dist_m / DISTANCE_STEP_M)
-    current_lon += (end_point["lon"] - start_point["lon"]) / (segment_dist_m / DISTANCE_STEP_M)
-
-    dist_to_asok_km = haversine(current_lat, current_lon, 
-                                ASOK_INTERSECTION["lat"], ASOK_INTERSECTION["lon"])
+    current_lat += (end_point["lat"] - start_point["lat"]) / (segment_dist_m / distance_step_m)
+    current_lon += (end_point["lon"] - start_point["lon"]) / (segment_dist_m / distance_step_m)
                                 
-    if haversine(current_lat, current_lon, end_point["lat"], end_point["lon"]) < DISTANCE_STEP_M/1000:
+    if haversine(current_lat, current_lon, end_point["lat"], end_point["lon"]) < distance_step_m/1000:
         polyline_index += 1
         current_lat = end_point["lat"]
         current_lon = end_point["lon"]
-        print(f"\n--- AMBULANCE CROSSED SEGMENT {polyline_index-1} ---\n")
+        print(f"\nCrossed segment {polyline_index-1}\n")
 
     telemetry = {
         "vehicle_id": AMBULANCE_ID,
@@ -148,18 +123,16 @@ def get_ambulance_telemetry():
             "lat": round(current_lat, 6),
             "lon": round(current_lon, 6)
         },
-        "speed_kmh": SPEED_KMH,
+        "speed_kmh": round(current_speed, 1),
         "status": "EMERGENCY_TRANSIT",
         "distance_to_asok_km": round(dist_to_asok_km, 3)
     }
     
     producer.produce(GPS_TOPIC, key=AMBULANCE_ID, value=json.dumps(telemetry))
-    
     return telemetry
 
 def run_simulation():
-    """Main simulation loop"""
-    i = 0
+    iteration = 0
     while True:
         density = get_next_density()
         gps = get_ambulance_telemetry()
@@ -167,24 +140,19 @@ def run_simulation():
         if gps is None:
             break
             
-        print(f"[{i:03}] -> Sent GPS (Dist to ASOK: {gps['distance_to_asok_km']} km)")
-        print(f"      -> Sent Sensor (ASOK Density: {density['density_percent']}%)")
+        print(f"[{iteration:03}] Distance: {gps['distance_to_asok_km']} km, Density: {density['density_percent']}%")
         
         producer.flush(timeout=1)
         time.sleep(UPDATE_INTERVAL_S)
-        i += 1
+        iteration += 1
 
 if __name__ == "__main__":
-    print("Kafka producer configured and ready.")
-    print(f"Bootstrap Server: {BOOTSTRAP_SERVER}")
-    print("Ready to produce messages to topics:")
-    print(f"  - {GPS_TOPIC}")
-    print(f"  - {SENSOR_TOPIC}")
-    print(f"  - {TOPIC_TRAFFIC_COMMANDS}")
-    print("\nStarting simulation...")
+    print("Producer initialized")
+    print(f"Topics: {GPS_TOPIC}, {SENSOR_TOPIC}, {COMMAND_TOPIC}")
+    print("Starting simulation\n")
     
     try:
         run_simulation()
     except KeyboardInterrupt:
-        print("\nSimulation stopped by user.")
+        print("\nStopped")
         producer.flush()
