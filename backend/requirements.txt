@@ -1,3 +1,0 @@
-# backend/requirements.txt
-confluent-kafka
-google-cloud-aiplatform
